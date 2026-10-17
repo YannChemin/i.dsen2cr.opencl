@@ -76,6 +76,30 @@ python3 tests/reference_compare.py dsen2cr_sar_carl.safetensors [options]
 
 With the published CARL model the outputs agree to 0.015 digital numbers.
 
+### Real-data test
+
+`tools/cdse_s1s2_pair.py` finds and downloads, from the Copernicus Data
+Space Ecosystem, a partly cloudy Sentinel-2 L1C scene (13 bands), the
+closest Sentinel-1 GRD backscatter (VV, VH in dB) and a clear Sentinel-2
+reference scene, on one 10 m UTM grid (defaults: Kanpur, 2025). It uses
+the CDSE account in `~/.netrc` (or `CDSE_CLIENT_ID`/`CDSE_CLIENT_SECRET`)
+and needs requests, numpy, pyproj and rasterio:
+
+```sh
+python3 tools/cdse_s1s2_pair.py --dry-run          # selection only
+python3 tools/cdse_s1s2_pair.py --out ~/RSDATA/Kanpur_DSen2CR
+```
+
+`tools/evaluate_pair.sh` imports such a set into a new GRASS project,
+runs the module and prints, per band, the mean absolute difference to
+the clear scene for the input and the output, inside and outside the
+clouds (Sentinel Hub cloud mask):
+
+```sh
+tools/evaluate_pair.sh ~/RSDATA/Kanpur_DSen2CR ~/grassdata/kanpur_dsen2cr \
+    ~/models/dsen2cr/dsen2cr_sar_carl.safetensors tile=1024 platform=Clover
+```
+
 ## Reference
 
 Meraner, A., Ebel, P., Zhu, X. X., Schmitt, M., 2020. Cloud removal in

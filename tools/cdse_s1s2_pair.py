@@ -65,7 +65,21 @@ PROCESS_URL = f"{SH_URL}/api/v1/process"
 # Extent of the Kanpur Sentinel-1/-2 composites in ~/RSDATA/Kanpur_Sentinel_2025.
 KANPUR_BBOX = (80.0763, 26.2635, 80.3275, 26.4882)
 
-S2_BANDS = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B10", "B11", "B12"]
+S2_BANDS = [
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B8A",
+    "B09",
+    "B10",
+    "B11",
+    "B12",
+]
 MAX_REQUEST = 2500  # Process API limit on output width and height.
 
 EVAL_S2 = """//VERSION=3
@@ -76,6 +90,23 @@ function setup() {
 function evaluatePixel(s) { return [%s]; }
 """ % (json.dumps(S2_BANDS), ", ".join(f"s.{b}" for b in S2_BANDS))
 
+# Screening: cloud mask, data mask and opaque cloud (mean visible TOA
+# reflectance above 0.30). The Sentinel Hub cloud mask also flags haze,
+# which is not what DSen2-CR is for.
+THICK_DN = 3000
+EVAL_SCREEN = (
+    """//VERSION=3
+function setup() {
+  return {input: [{bands: ["B02", "B03", "B04", "CLM", "dataMask"], units: ["DN", "DN", "DN", "DN", "DN"]}],
+          output: {bands: 3, sampleType: "UINT8"}};
+}
+function evaluatePixel(s) {
+  return [s.CLM, (s.B02 + s.B03 + s.B04) / 3 > %d ? 1 : 0, s.dataMask];
+}
+"""
+    % THICK_DN
+)
+
 EVAL_S2_MASK = """//VERSION=3
 function setup() {
   return {input: [{bands: ["CLM", "CLP", "dataMask"]}],
@@ -84,12 +115,22 @@ function setup() {
 function evaluatePixel(s) { return [s.CLM, s.CLP, s.dataMask]; }
 """
 
+EVAL_S1_MASK = """//VERSION=3
+function setup() {
+  // VV is read only because orthorectification needs a data band.
+  return {input: [{bands: ["VV", "dataMask"]}], output: {bands: 1, sampleType: "UINT8"}};
+}
+function evaluatePixel(s) { return [s.dataMask]; }
+"""
+
 EVAL_S1 = """//VERSION=3
 function setup() {
   return {input: [{bands: ["VV", "VH", "dataMask"]}],
           output: {bands: 2, sampleType: "FLOAT32"}};
 }
-function db(v) { return v > 0 ? 10 * Math.log(v) / Math.LN10 : NaN; }
+// Zero backscatter (calm water, radar shadow) is valid data: floor it at
+// -50 dB, below the DSen2-CR clipping range, rather than making it null.
+function db(v) { return v > 1e-5 ? 10 * Math.log(v) / Math.LN10 : -50; }
 function evaluatePixel(s) {
   if (s.dataMask == 0) return [NaN, NaN];
   return [db(s.VV), db(s.VH)];
@@ -105,7 +146,9 @@ class Progress:
 
     def __init__(self, slot, name):
         runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-        self.dir = Path(os.environ.get("METAMONITOR_SPOOL", Path(runtime, "metamonitor", "slots")))
+        self.dir = Path(
+            os.environ.get("METAMONITOR_SPOOL", Path(runtime, "metamonitor", "slots"))
+        )
         self.slot, self.name, self.last = slot, name, 0.0
 
     def __call__(self, done, total, detail, state="running", force=False):
@@ -167,17 +210,27 @@ class Session:
         self.expires = time.time() + tok.get("expires_in", 600)
 
     def post(self, url, payload, accept="application/json"):
-        """POST JSON with retries on rate limiting and server errors."""
-        for attempt in range(6):
+        """POST JSON with retries on rate limiting, server and network
+        errors."""
+        r = None
+        for attempt in range(8):
             self._token()
-            r = self.http.post(url, json=payload, headers={"Accept": accept}, timeout=600)
+            try:
+                r = self.http.post(
+                    url, json=payload, headers={"Accept": accept}, timeout=600
+                )
+            except requests.RequestException as e:
+                print(f"  {type(e).__name__}: {e}; retrying", flush=True)
+                time.sleep(min(120, 2 ** (attempt + 2)))
+                continue
             if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(min(60, 2 ** (attempt + 1)))
+                time.sleep(min(120, 2 ** (attempt + 2)))
                 continue
             if r.status_code != 200:
                 sys.exit(f"{url}: HTTP {r.status_code}: {r.text[:500]}")
             return r
-        sys.exit(f"{url}: giving up after repeated HTTP {r.status_code}")
+        status = "network errors" if r is None else f"HTTP {r.status_code}"
+        sys.exit(f"{url}: giving up after repeated {status}")
 
 
 def utm_grid(bbox, res):
@@ -198,7 +251,12 @@ def utm_grid(bbox, res):
     ymin = math.floor(min(ys) / res) * res
     xmax = math.ceil(max(xs) / res) * res
     ymax = math.ceil(max(ys) / res) * res
-    return epsg, (xmin, ymin, xmax, ymax), round((xmax - xmin) / res), round((ymax - ymin) / res)
+    return (
+        epsg,
+        (xmin, ymin, xmax, ymax),
+        round((xmax - xmin) / res),
+        round((ymax - ymin) / res),
+    )
 
 
 def catalog(session, collection, bbox, start, end):
@@ -296,56 +354,104 @@ def s1_data(day):
 
 
 def screen(session, epsg, extent, dates, screen_res, progress):
-    """Cloud fraction and coverage of each Sentinel-2 date inside the area."""
+    """Cloud mask fraction, opaque cloud fraction and data coverage of each
+    Sentinel-2 date inside the area."""
     width = max(1, math.ceil((extent[2] - extent[0]) / screen_res))
     height = max(1, math.ceil((extent[3] - extent[1]) / screen_res))
     stats = {}
     for i, day in enumerate(sorted(dates)):
         progress(i, len(dates), f"screening Sentinel-2 {day}")
-        clm, _, valid = process(session, epsg, extent, width, height, s2_data(day), EVAL_S2_MASK)
-        nvalid = int((valid > 0).sum())
+        clm, thick, valid = process(
+            session, epsg, extent, width, height, s2_data(day), EVAL_SCREEN
+        )
+        ok = valid > 0
+        nvalid = int(ok.sum())
         stats[day] = {
             "coverage": nvalid / valid.size,
-            "cloud_fraction": float((clm[valid > 0] > 0).mean()) if nvalid else 1.0,
-            "granule_cloud_cover": [f["properties"].get("eo:cloud_cover") for f in dates[day]],
+            "cloud_fraction": float((clm[ok] > 0).mean()) if nvalid else 1.0,
+            "thick_fraction": float((thick[ok] > 0).mean()) if nvalid else 1.0,
+            "granule_cloud_cover": [
+                f["properties"].get("eo:cloud_cover") for f in dates[day]
+            ],
         }
         print(
             f"  {day}: coverage {stats[day]['coverage']:6.1%}, "
-            f"cloud {stats[day]['cloud_fraction']:6.1%}",
+            f"cloud mask {stats[day]['cloud_fraction']:6.1%}, "
+            f"opaque {stats[day]['thick_fraction']:6.1%}",
             flush=True,
         )
     return stats
 
 
+def screen_s1(session, epsg, extent, dates, screen_res, progress):
+    """Coverage of the area by each Sentinel-1 date: the catalog only tells
+    that a footprint intersects it."""
+    width = max(1, math.ceil((extent[2] - extent[0]) / screen_res))
+    height = max(1, math.ceil((extent[3] - extent[1]) / screen_res))
+    coverage = {}
+    for i, day in enumerate(dates):
+        progress(i, len(dates), f"screening Sentinel-1 {day}")
+        (valid,) = process(
+            session, epsg, extent, width, height, s1_data(day), EVAL_S1_MASK
+        )
+        coverage[day] = float((valid > 0).mean())
+        print(f"  S1 {day}: coverage {coverage[day]:6.1%}", flush=True)
+    return coverage
+
+
 def choose(stats, s1_dates, args):
     """Best (cloudy, clear, s1) date triple, or None.
 
-    Prefers a cloud fraction near 40 %, then short gaps to the SAR and the
-    clear date.
+    The cloudy date is chosen on its opaque cloud fraction, preferring 30 %,
+    then short gaps to the SAR and the clear date. A clear date has little
+    cloud mask and no opaque cloud.
     """
 
     def days(a, b):
         return abs((dt.date.fromisoformat(a) - dt.date.fromisoformat(b)).days)
 
     full = {d: s for d, s in stats.items() if s["coverage"] >= args.min_coverage}
-    clear = [d for d, s in full.items() if s["cloud_fraction"] <= args.clear_max]
+    clear = [
+        d
+        for d, s in full.items()
+        if s["cloud_fraction"] <= args.clear_max and s["thick_fraction"] <= 0.002
+    ]
     best = None
     for day, s in full.items():
-        if not args.cloudy_min <= s["cloud_fraction"] <= args.cloudy_max:
+        if not args.cloudy_min <= s["thick_fraction"] <= args.cloudy_max:
             continue
         s1 = min(s1_dates, key=lambda d: days(d, day), default=None)
-        ref = min((c for c in clear if c != day), key=lambda d: days(d, day), default=None)
+        ref = min(
+            (c for c in clear if c != day), key=lambda d: days(d, day), default=None
+        )
         if s1 is None or ref is None:
             continue
         if days(s1, day) > args.max_s1_gap or days(ref, day) > args.max_clear_gap:
             continue
-        score = abs(s["cloud_fraction"] - 0.4) + 0.03 * days(s1, day) + 0.01 * days(ref, day)
+        score = (
+            abs(s["thick_fraction"] - 0.3)
+            + 0.03 * days(s1, day)
+            + 0.01 * days(ref, day)
+        )
         if best is None or score < best[0]:
             best = (score, day, ref, s1)
     return None if best is None else best[1:]
 
 
-def download(session, epsg, extent, cols, rows, res, data, evalscript, nbands, dtype, progress, what):
+def download(
+    session,
+    epsg,
+    extent,
+    cols,
+    rows,
+    res,
+    data,
+    evalscript,
+    nbands,
+    dtype,
+    progress,
+    what,
+):
     """Full-resolution image assembled from requests of <= MAX_REQUEST cells."""
     out = np.zeros((nbands, rows, cols), dtype=dtype)
     tiles = [
@@ -363,7 +469,9 @@ def download(session, epsg, extent, cols, rows, res, data, evalscript, nbands, d
             extent[0] + (c0 + w) * res,
             extent[3] - r0 * res,
         )
-        out[:, r0 : r0 + h, c0 : c0 + w] = process(session, epsg, ext, w, h, data, evalscript)
+        out[:, r0 : r0 + h, c0 : c0 + w] = process(
+            session, epsg, ext, w, h, data, evalscript
+        )
     return out
 
 
@@ -382,6 +490,8 @@ def write_tif(path, array, epsg, extent, res, descriptions, nodata=None):
         "compress": "deflate",
         "tiled": True,
         "nodata": nodata,
+        # Never RGB: GRASS would name the bands .red/.green/.blue.
+        "photometric": "MINISBLACK",
     }
     with rasterio.open(path, "w", **profile) as ds:
         ds.write(array)
@@ -392,28 +502,54 @@ def write_tif(path, array, epsg, extent, res, descriptions, nodata=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--bbox", type=float, nargs=4, default=KANPUR_BBOX, metavar=("W", "S", "E", "N"))
+    parser.add_argument(
+        "--bbox", type=float, nargs=4, default=KANPUR_BBOX, metavar=("W", "S", "E", "N")
+    )
     parser.add_argument("--start", default="2025-01-01")
     parser.add_argument("--end", default="2025-12-31")
-    parser.add_argument("--out", type=Path, default=Path.home() / "RSDATA" / "Kanpur_DSen2CR")
+    parser.add_argument(
+        "--out", type=Path, default=Path.home() / "RSDATA" / "Kanpur_DSen2CR"
+    )
     parser.add_argument("--res", type=float, default=10.0, help="output cell size (m)")
-    parser.add_argument("--screen-res", type=float, default=160.0, help="screening cell size (m, at most 200)")
-    parser.add_argument("--cloudy-min", type=float, default=0.2)
-    parser.add_argument("--cloudy-max", type=float, default=0.7)
-    parser.add_argument("--clear-max", type=float, default=0.02)
+    parser.add_argument(
+        "--screen-res",
+        type=float,
+        default=160.0,
+        help="screening cell size (m, at most 200)",
+    )
+    parser.add_argument(
+        "--cloudy-min", type=float, default=0.1, help="opaque cloud fraction"
+    )
+    parser.add_argument(
+        "--cloudy-max", type=float, default=0.6, help="opaque cloud fraction"
+    )
+    parser.add_argument(
+        "--clear-max", type=float, default=0.05, help="cloud mask fraction"
+    )
     parser.add_argument("--min-coverage", type=float, default=0.99)
     parser.add_argument("--max-s1-gap", type=int, default=3, help="days")
     parser.add_argument("--max-clear-gap", type=int, default=20, help="days")
-    parser.add_argument("--cloudy-date", help="force the cloudy Sentinel-2 date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--cloudy-date", help="force the cloudy Sentinel-2 date (YYYY-MM-DD)"
+    )
     parser.add_argument("--clear-date", help="force the clear Sentinel-2 date")
     parser.add_argument("--s1-date", help="force the Sentinel-1 date")
-    parser.add_argument("--dry-run", action="store_true", help="stop after the selection")
+    parser.add_argument(
+        "--reuse-screening",
+        type=Path,
+        help="screening.json of an earlier run, to skip the Sentinel-2 screening",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="stop after the selection"
+    )
     args = parser.parse_args()
 
     progress = Progress("cdse-s1s2-pair", "CDSE S1/S2 pair download")
     session = Session()
     epsg, extent, cols, rows = utm_grid(args.bbox, args.res)
-    print(f"Grid: EPSG:{epsg}, {cols} x {rows} cells of {args.res:g} m, extent {extent}")
+    print(
+        f"Grid: EPSG:{epsg}, {cols} x {rows} cells of {args.res:g} m, extent {extent}"
+    )
 
     forced = args.cloudy_date and args.clear_date and args.s1_date
     if forced:
@@ -421,18 +557,48 @@ def main():
         stats = {}
     else:
         progress(0, 1, "catalog search", force=True)
-        s2 = by_date(catalog(session, "sentinel-2-l1c", args.bbox, args.start, args.end))
-        s1_all = by_date(catalog(session, "sentinel-1-grd", args.bbox, args.start, args.end))
-        s1_dates = sorted(d for d, fs in s1_all.items() if any(s1_usable(f) for f in fs))
-        print(f"Catalog: {len(s2)} Sentinel-2 L1C dates, {len(s1_dates)} Sentinel-1 IW DV dates")
+        s2 = by_date(
+            catalog(session, "sentinel-2-l1c", args.bbox, args.start, args.end)
+        )
+        s1_all = by_date(
+            catalog(session, "sentinel-1-grd", args.bbox, args.start, args.end)
+        )
+        s1_dates = sorted(
+            d for d, fs in s1_all.items() if any(s1_usable(f) for f in fs)
+        )
+        print(
+            f"Catalog: {len(s2)} Sentinel-2 L1C dates, {len(s1_dates)} Sentinel-1 IW DV dates"
+        )
         # Granules fully clouded or clear everywhere need no screening.
         candidates = {
             d: fs
             for d, fs in s2.items()
             if min(f["properties"].get("eo:cloud_cover", 0) for f in fs) < 98
         }
-        print(f"Screening {len(candidates)} dates at {args.screen_res:g} m...")
-        stats = screen(session, epsg, extent, candidates, args.screen_res, progress)
+        if args.reuse_screening:
+            saved = json.loads(args.reuse_screening.read_text())
+            stats = saved.get("s2", saved)
+            print(f"Reusing the Sentinel-2 screening of {len(stats)} dates")
+        else:
+            print(f"Screening {len(candidates)} dates at {args.screen_res:g} m...")
+            stats = screen(session, epsg, extent, candidates, args.screen_res, progress)
+        # Only Sentinel-1 dates near a possible cloudy date need screening.
+        cloudy_days = [
+            dt.date.fromisoformat(d)
+            for d, s in stats.items()
+            if args.cloudy_min <= s["thick_fraction"] <= args.cloudy_max
+        ]
+        near = [
+            d
+            for d in s1_dates
+            if any(
+                abs((dt.date.fromisoformat(d) - c).days) <= args.max_s1_gap
+                for c in cloudy_days
+            )
+        ]
+        print(f"Screening {len(near)} Sentinel-1 dates...")
+        s1_cov = screen_s1(session, epsg, extent, near, args.screen_res, progress)
+        s1_dates = [d for d in near if s1_cov[d] >= args.min_coverage]
         picked = choose(stats, s1_dates, args)
         if picked is None:
             progress(1, 1, "no suitable date triple", state="failed", force=True)
@@ -446,9 +612,14 @@ def main():
         s1 = args.s1_date or s1
     print(
         f"Selected: cloudy S2 {cloudy} "
-        f"({stats.get(cloudy, {}).get('cloud_fraction', float('nan')):.1%} cloud), "
+        f"({stats.get(cloudy, {}).get('thick_fraction', float('nan')):.1%} opaque cloud), "
         f"clear S2 {clear}, S1 {s1}"
     )
+    if stats:
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "screening.json").write_text(
+            json.dumps({"s2": stats, "s1": s1_cov}, indent=2)
+        )
     if args.dry_run:
         progress(1, 1, f"selected {cloudy} / {clear} / {s1}", state="done", force=True)
         return
@@ -457,8 +628,26 @@ def main():
     jobs = [
         ("s2_l1c_cloudy", cloudy, s2_data(cloudy), EVAL_S2, 13, np.uint16, S2_BANDS, 0),
         ("s2_l1c_clear", clear, s2_data(clear), EVAL_S2, 13, np.uint16, S2_BANDS, 0),
-        ("s2_cloudmask_cloudy", cloudy, s2_data(cloudy), EVAL_S2_MASK, 3, np.uint8, ["CLM", "CLP", "dataMask"], None),
-        ("s1_grd_db", s1, s1_data(s1), EVAL_S1, 2, np.float32, ["VV", "VH"], float("nan")),
+        (
+            "s2_cloudmask_cloudy",
+            cloudy,
+            s2_data(cloudy),
+            EVAL_S2_MASK,
+            3,
+            np.uint8,
+            ["CLM", "CLP", "dataMask"],
+            None,
+        ),
+        (
+            "s1_grd_db",
+            s1,
+            s1_data(s1),
+            EVAL_S1,
+            2,
+            np.float32,
+            ["VV", "VH"],
+            float("nan"),
+        ),
     ]
     files = {}
     for i, (stem, day, data, script, nb, dtype, desc, nodata) in enumerate(jobs):
@@ -469,7 +658,20 @@ def main():
         def step(done, total, detail, state="running", force=False, i=i):
             sub(i + done / total, len(jobs), detail, state, force)
 
-        array = download(session, epsg, extent, cols, rows, args.res, data, script, nb, dtype, step, what)
+        array = download(
+            session,
+            epsg,
+            extent,
+            cols,
+            rows,
+            args.res,
+            data,
+            script,
+            nb,
+            dtype,
+            step,
+            what,
+        )
         path = args.out / f"{stem}_{day.replace('-', '')}.tif"
         write_tif(path, array, epsg, extent, args.res, desc, nodata)
         files[stem] = path.name

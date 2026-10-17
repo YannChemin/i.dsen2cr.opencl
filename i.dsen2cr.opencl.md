@@ -106,6 +106,17 @@ The OpenCL implementation was checked against a PyTorch forward pass
 (in double precision) of the published CARL model: the outputs agree to
 within 0.015 digital numbers in every band.
 
+On real data (Kanpur, India: Sentinel-2 L1C of 7 May 2025 with 32 %
+opaque cloud, Sentinel-1 of 4 May, clear Sentinel-2 of 10 May as
+reference, 2522 x 2506 cells, 250 seconds on the WX 7100), the mean
+absolute difference to the clear scene under opaque cloud drops from
+2000-3300 digital numbers in the input to 90-630 in the output, in every
+band. Under thick cloud the reconstruction is smooth and darker than the
+reference, and cloud shadows are kept: the SAR carries the structure
+(roads, field patterns) but not all of the optical detail. B09 (water
+vapour) comes out about 300 digital numbers too high everywhere, an
+atmospheric band the network fills in from its training data.
+
 ## EXAMPLES
 
 ### Cloud removal with SAR
